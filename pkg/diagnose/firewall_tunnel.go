@@ -19,6 +19,7 @@ limitations under the License.
 package diagnose
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -26,11 +27,14 @@ import (
 	"github.com/submariner-io/subctl/pkg/cluster"
 	"github.com/submariner-io/submariner-operator/api/submariner/v1alpha1"
 	subv1 "github.com/submariner-io/submariner/pkg/apis/submariner.io/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/uuid"
 )
 
 const (
 	clientSourcePort = "9898"
+	loadBalancerName = "submariner-gateway"
+	encapsPortName   = "cable-encaps"
 )
 
 func TunnelConfigAcrossClusters(localClusterInfo, remoteClusterInfo *cluster.Info, options FirewallOptions,
@@ -69,9 +73,16 @@ func TunnelConfigAcrossClusters(localClusterInfo, remoteClusterInfo *cluster.Inf
 		return false
 	}
 
+	portFilter := fmt.Sprintf("dst port %d", tunnelPort)
+	lbNodePort, ok := getLbNodePort(localClusterInfo, localEndpoint, status)
+
+	if ok {
+		portFilter += fmt.Sprintf(" or dst port %d ", lbNodePort)
+	}
+
 	clientMessage := string(uuid.NewUUID())[0:8]
-	podCommand := fmt.Sprintf("timeout %d tcpdump -ln -Q in -A -s 100 -i any udp and dst port %d | grep '%s'",
-		options.ValidationTimeout, tunnelPort, clientMessage)
+	podCommand := fmt.Sprintf("timeout %d tcpdump -ln -Q in -A -s 100 -i any udp and %s | grep '%s'",
+		options.ValidationTimeout, portFilter, clientMessage)
 
 	sPod, err := spawnSnifferPodOnNode(localClusterInfo.ClientProducer.ForKubernetes(), gwNodeName, options.PodNamespace, podCommand)
 	if err != nil {
@@ -87,7 +98,7 @@ func TunnelConfigAcrossClusters(localClusterInfo, remoteClusterInfo *cluster.Inf
 		return false
 	}
 
-	podCommand = fmt.Sprintf("for x in $(seq 1000); do echo %s; done | for i in $(seq 5);"+
+	podCommand = fmt.Sprintf("for x in $(seq 1000); do sleep 0.01 && echo %s; done | for i in $(seq 5);"+
 		" do timeout 2 nc -n -p %s -u %s %d; done", clientMessage, clientSourcePort, gatewayPodIP, tunnelPort)
 
 	// Spawn the pod on the nonGateway node. If we spawn the pod on Gateway node, the tunnel process can
@@ -185,4 +196,28 @@ func getGatewayIP(clusterInfo *cluster.Info, localClusterID string, status repor
 	status.Failure("The gateway on cluster %q does not have an active connection to cluster %q", clusterInfo.Name, localClusterID)
 
 	return ""
+}
+
+func getLbNodePort(clusterInfo *cluster.Info, endpoint *subv1.Endpoint, status reporter.Interface) (int32, bool) {
+	var lbNodePort int32
+
+	usingLoadBalancer, _ := endpoint.Spec.GetBackendBool(subv1.UsingLoadBalancer, nil)
+
+	if usingLoadBalancer == nil || !*usingLoadBalancer {
+		return lbNodePort, false
+	}
+
+	svc, err := clusterInfo.ClientProducer.ForKubernetes().CoreV1().Services(endpoint.GetNamespace()).Get(
+		context.TODO(), loadBalancerName, metav1.GetOptions{})
+	if err == nil {
+		for _, port := range svc.Spec.Ports {
+			if port.Name == encapsPortName {
+				return port.NodePort, true
+			}
+		}
+	} else {
+		status.Failure(fmt.Sprintf("Error retrieving gateway LB service: %v", err))
+	}
+
+	return lbNodePort, false
 }
